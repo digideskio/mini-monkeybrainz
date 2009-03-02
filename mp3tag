@@ -1,0 +1,331 @@
+#!/usr/bin/env python
+
+"""
+monitor a directory:
+  - id files via genpuid (musicdns)
+  - update ID3 tags and rewrite filename
+
+"""
+
+__author__ = 'albert choi <albert.choi@gmail.com>'
+
+# stdlib imports
+import sys
+import string
+import datetime
+import commands
+import os
+import urllib
+import operator as op
+from xml.etree import ElementTree
+from time import time
+
+
+from mutagen.mp3 import MP3
+
+
+GENPUID = 'genpuid %(key)s '
+GENPUID += '-xml=%(xmlfile)s '           # store metadata xml in a timestamped file 
+GENPUID += '-ext=mb,data '               # mb:hit musicbrainz
+GENPUID += '-rmd=1 '                     # return more metadata
+GENPUID += '-m3lib=cache.musicdns '      # cache results in binary 
+GENPUID += ' %(files)s '                 # single query for multiple files
+
+
+"""
+== RIPPED from genpuid docs ===
+
+    INSTRUCTIONS
+    ============
+
+    From the command line, run:
+    genpuid [dns-key] [options] file1 file2 ...
+
+    This will identify the files, invoking fingerprints and analysis as
+    necessary, and print out the PUID retrieved from MusicDNS.
+
+    Your MusicDNS key (used by the parameter [dns-key]) must be valid. Keys can
+    be generated for free at: http://musicip.com/dns/key.jsp.
+
+    ----------
+    I. OPTIONS
+    ----------
+
+    [*] -aac={on|off}
+      By default genpuid will not modify AAC files. Using the -aac=on option
+      changes this behavior to allow, for instance, the -archive option to
+      be used.
+
+    [*] -archive
+      Write MusicIP tags into the song files as they are identified.
+      (MusicMagic Data and MusicMagic Fingerprint). 
+
+    [*] -data
+      Returns the analysis data.
+
+    [*] -exclude {expression}
+      Ignores files matching the given expression. The expression syntax is
+      available at http://www.musicip.com/mixer/powersearch.jsp
+
+      Example: -exclude length<120 
+        Excludes all songs less than 120 seconds in length.
+
+      Example: -exclude genre=Polka
+        Excludes all songs of the genre Polka.
+
+            Note that some characters, like <, may have special meanings to
+            your shell, and will need to be escaped appropriately.
+
+    [*] -ext={comma-separated extension list}
+      Returns extra metadata in the response.
+      Extension values:
+        data: Returns the analysis data
+        lyrics: Return LyricFind song lyrics. Requires an extra license.
+          Contact a MusicIP sales representative for more info.
+        mb: Returns metadata from the MusicBrainz database.
+
+    [*] -fs={encoding type}
+      Linux Only - Indicates a character encoding type to use for reading
+            files.  This applies only to the filenames, and not the metadata inside
+            the files. Typically this is set to "ISO8859-1". The encoding should 
+            match the underlying file system.
+
+    [*] -logex
+      Creates a log file in the directory from which GenPUID is being
+      executed.
+
+    [*] -m3lib={filename}
+      Used to store the results in a MusicIP Mixer cache file. If the cache
+      already exists, it will be updated. If an m3lib file is passed
+      to genPUID and no music files or directories are passed for processing,
+      data will be retrieved and output for all songs in the m3lib.
+
+    [*] -m3xml={filename}
+      Creates an M3XML file as output. Using a new file name to the option
+      and passing a m3lib file with the -m3lib={filename} option will read
+      the m3lib file and create an m3xml file from the contents.
+        Example: -m3xml=newfile.m3xml -m3lib=existingfile.m3lib
+
+    [*] -noanalysis
+      Does not return analysis data or create new PUIDs for tracks.
+
+    [*] -nopath
+      Excludes full file paths for the tracks in the XML output.
+
+    [*] -nopuid
+      Bypass the PUID lookup. Useful for just analyzing files.
+
+    [*] -nosha
+      Bypass the SHA1 lookup.
+
+    [*] -print
+      Returns the fingerprint.
+
+    [*] -proxy (proxy host)
+      Defines the proxy host to use. Default port is 8080.
+
+    [*] -proxy_port (port number) 
+         Optional. Defines a proxy port to use with the proxy host. 
+
+    [*] -proxy_user (username) 
+         Optional. Defines the proxy username to use with the proxy host.
+
+    [*] -proxy_pass (password)
+         Optional. Defines the proxy password to use with the proxy username. 
+
+    [*] -qtmp3
+      Windows Only - Use the QuickTime decoder on MP3 files. May be useful
+      for analyzing files which are marked unanalyzable.
+
+    [*] -r
+      Pass directories to be processed. Recursively processes all 
+      sub-directories.
+
+    [*] -rmd={1|2}
+      Returns extra metadata.
+        1: Include basic artists name and track title metadata
+        2: Include extra metadata (release year, genre)
+
+    [*] -threads={number of threads}
+      Run genPUID in multithread mode to improve performance.
+
+    [*] -v
+      Print version number and exit.
+
+    [*] -xml[={xml output file}]
+      Generate output in XML format. An optional output file can be specified.
+
+"""
+
+
+def esc(filename):
+  def remap(c):
+    safe = {' ': '\ ',
+            '|': '\|',
+            '(': '\(',
+            ')': '\)',}
+    if c in safe:
+      return safe[c]
+    return c 
+  return ''.join([remap(c) for c in filename])
+
+
+def scrub(filenames, apikey):
+  ''' filename '''
+  assert(apikey)
+  filenames = map(esc, filenames)
+
+  now = datetime.datetime.now()
+  xmlfile = "/tmp/musicdns-%02d-%02d-%02d.xml" % (now.month, now.day, now.minute)
+    
+  cmd = GENPUID % dict(key=apikey, xmlfile=xmlfile, files=' '.join(filenames))
+  
+  print '>>> calling genpuid '
+  start = time()
+  (exitstatus, output) = commands.getstatusoutput(cmd)
+  print '<<< done. ', time() - start
+  
+  if exitstatus != 0:
+    # unexpected error response.
+    print cmd
+    print output
+    raise Exception, "subprocess failed for some reason. see log.txt"
+
+  return xmlfile
+
+
+def parse_metadata(filename):
+  et = ElementTree.parse(filename)
+  matches = []
+
+  for track in et.findall('track'):
+    def get(key, fn):
+      try: d[key] = fn(track)
+      except: pass
+
+    d = dict(track.items()) # writes keys: puid and file
+    d['TXXX:PUID'] = d['puid'] # make puid get stored by shuffling it in TXXX
+
+    get('artist',
+        lambda t: t.findtext('artist/name'))
+    get('composer',
+        lambda t: t.findtext('artist/name'))
+    get('title',
+        lambda t: t.findtext('title'))
+    get('album',
+        lambda t: t.findtext('release-list/release/title'))
+    get('track',
+        lambda t: t.find('release-list/release/track-list').get('offset'))
+    get('genre',
+        lambda t: t[-1][0].findtext('name'))
+    get('year',
+        lambda t: str(int(t[-2].text)))
+    
+    matches.append(d)
+
+  return matches
+
+
+
+def update_tags(meta, dir_, copy=True, lastfm=False):
+  assert meta['artist']
+  path_elements = [dir_, meta['artist'].encode('latin-1', 'ignore')]
+  sep = os.path.sep
+
+  (exitstatus, output) = commands.getstatusoutput("mkdir -p %s" % esc(sep.join(path_elements)))
+  if exitstatus != 0:
+    print 'FAILED to make directory for %s' % meta['artist']
+    print output
+    return None
+
+  src = meta['file'] # fully qualified in the meta parse
+  dst = path_elements[:] + [meta['title'].encode('latin-1', 'ignore') + '.mp3'] 
+
+  if copy:
+    dstfile = esc(sep.join(dst))
+    if os.path.exists(dstfile):
+      dstfile = dstfile.replace('mp3', '1.mp3') # yuck
+    
+    cmd = "cp %s %s" % (esc(src), dstfile)
+    (exitstatus, output) = commands.getstatusoutput(cmd)
+    
+  if reduce(op.and_, map(lambda x: len(unicode(x)) < 30, meta.values())):
+    # we expect a failure here
+    print 'WARNING: metadata has fields longer than 30 chars:', meta
+    
+  info = MP3(sep.join(dst))
+
+  for k,v in meta.iteritems():
+    try:
+      info[k] = v
+    except:
+      pass
+  info.pprint()
+
+  # hit lastfm
+  if lastfm:
+    extra = fill_lastfm(meta)
+    if 'img' in extra:
+      img = urllib.urlopen(extra['img']).read()
+      
+
+      
+  # flush tags
+  info.save()
+
+  # if we got here, it's safe to delete src file
+  cmd = 'mv %s /tmp' % esc(meta['file'])
+  #(exitstatus, output) = commands.getstatusoutput(cmd)
+  
+
+def fill_lastfm(meta):
+  from pylast import Album, Artist, Track
+  API = eval(open(os.path.sep.join([os.environ['HOME'], '.apikey'])).read())
+  auth = (key,secret,session) = API['LASTFM_KEY'], API['LASTFM_SECRET'], API['LASTFM_SESS']
+
+  album = Album(meta['artist'], meta['album'], *auth)
+  img = album.getImage()
+  return dict(img=img)
+
+
+def main():
+  import optparse
+  parser = optparse.OptionParser(__doc__.strip())
+
+  # we need a musicdns api key
+  parser.add_option('-k', '--musicdns-key', action='store_true',
+                    help="Music DNS key")
+  opts, args = parser.parse_args()
+  if not opts.musicdns_key:
+    keyfn = os.path.join(os.environ['HOME'], '.musicdns_key')
+    opts.musicdns_key = open(keyfn).read().strip()
+
+
+  try:
+    dir_ = os.path.abspath(args[0])
+  except:
+    dir_ = os.path.abspath(os.path.curdir)
+
+  sep = os.path.sep
+  files = [dir_ + sep + f for f in os.listdir(dir_) if f.endswith('mp3')]
+  
+  response = scrub(files, opts.musicdns_key)
+  metas = parse_metadata(response)
+  
+  for m in metas:
+    if not m['artist'] or not m['title']:
+      print 'FAILED to get metadata for ', m['file']
+      continue
+
+    update_tags(m, dir_)
+    
+    try:
+      pass
+    except Exception, e:
+      print 'ERRORS while processing ' + m['file'], e
+  print len(metas), ' processed'
+  
+  
+if __name__ == '__main__':
+  main()
+
