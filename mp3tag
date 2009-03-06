@@ -5,9 +5,23 @@ monitor a directory:
   - id files via genpuid (musicdns)
   - update ID3 tags and rewrite filename
 
+REQUIREMENTS:
+1) signup for an account and API key here:
+     https://secure.musicip.com/dns/index.jsp
+
+2) store your key in $HOME/.musicdns
+
+3) download genpuid binaries (if you're not using OSX)
+     https://secure.musicip.com/dns/files/genpuid_osx_1.4.tgz
+
+
+python dependencies:
+  mutagen - easy_installable
+
 """
 
-__author__ = 'albert choi <albert.choi@gmail.com>'
+__author__    = 'albert choi <albert.choi@gmail.com>'
+__version__   = '0.1'
 
 # stdlib imports
 import sys
@@ -22,6 +36,8 @@ from time import time
 
 
 from mutagen.mp3 import MP3
+from mutagen.easyid3 import EasyID3
+
 
 
 GENPUID = 'genpuid %(key)s '
@@ -30,6 +46,17 @@ GENPUID += '-ext=mb,data '               # mb:hit musicbrainz
 GENPUID += '-rmd=1 '                     # return more metadata
 GENPUID += '-m3lib=cache.musicdns '      # cache results in binary 
 GENPUID += ' %(files)s '                 # single query for multiple files
+
+
+"""
+TASKS:
+  remove duplicates after fingerprinting
+  script itunes to add artwork (or embed artwork)
+  mv filesystem commands to shutil
+  write another utility function to just dump tag data
+  handle unicode filenames better
+
+"""
 
 
 """
@@ -161,6 +188,8 @@ GENPUID += ' %(files)s '                 # single query for multiple files
 def esc(filename):
   def remap(c):
     safe = {' ': '\ ',
+            "'": "\\'",
+            '"': '\\"',
             '|': '\|',
             '(': '\(',
             ')': '\)',}
@@ -176,7 +205,7 @@ def scrub(filenames, apikey):
   filenames = map(esc, filenames)
 
   now = datetime.datetime.now()
-  xmlfile = "/tmp/musicdns-%02d-%02d-%02d.xml" % (now.month, now.day, now.minute)
+  xmlfile = "/tmp/musicdns-%02d-%02d-%02d%02d.xml" % (now.month, now.day, now.hour, now.minute)
     
   cmd = GENPUID % dict(key=apikey, xmlfile=xmlfile, files=' '.join(filenames))
   
@@ -204,7 +233,7 @@ def parse_metadata(filename):
       except: pass
 
     d = dict(track.items()) # writes keys: puid and file
-    d['TXXX:PUID'] = d['puid'] # make puid get stored by shuffling it in TXXX
+    d['TXXX:PUID'] = d.get('puid', '') # make puid get stored by shuffling it in TXXX
 
     get('artist',
         lambda t: t.findtext('artist/name'))
@@ -227,7 +256,7 @@ def parse_metadata(filename):
 
 
 
-def update_tags(meta, dir_, copy=True, lastfm=False):
+def update_tags(meta, dir_, copy=True):
   assert meta['artist']
   path_elements = [dir_, meta['artist'].encode('latin-1', 'ignore')]
   sep = os.path.sep
@@ -245,62 +274,43 @@ def update_tags(meta, dir_, copy=True, lastfm=False):
     dstfile = esc(sep.join(dst))
     if os.path.exists(dstfile):
       dstfile = dstfile.replace('mp3', '1.mp3') # yuck
-    
     cmd = "cp %s %s" % (esc(src), dstfile)
     (exitstatus, output) = commands.getstatusoutput(cmd)
-    
+  else:
+    pass
+
   if reduce(op.and_, map(lambda x: len(unicode(x)) < 30, meta.values())):
     # we expect a failure here
     print 'WARNING: metadata has fields longer than 30 chars:', meta
-    
-  info = MP3(sep.join(dst))
 
+  info = MP3(sep.join(dst), ID3=EasyID3)
   for k,v in meta.iteritems():
     try:
       info[k] = v
     except:
       pass
-  info.pprint()
 
-  # hit lastfm
-  if lastfm:
-    extra = fill_lastfm(meta)
-    if 'img' in extra:
-      img = urllib.urlopen(extra['img']).read()
-      
-
-      
   # flush tags
   info.save()
 
   # if we got here, it's safe to delete src file
   cmd = 'mv %s /tmp' % esc(meta['file'])
-  #(exitstatus, output) = commands.getstatusoutput(cmd)
+  (exitstatus, output) = commands.getstatusoutput(cmd)
   
-
-def fill_lastfm(meta):
-  from pylast import Album, Artist, Track
-  API = eval(open(os.path.sep.join([os.environ['HOME'], '.apikey'])).read())
-  auth = (key,secret,session) = API['LASTFM_KEY'], API['LASTFM_SECRET'], API['LASTFM_SESS']
-
-  album = Album(meta['artist'], meta['album'], *auth)
-  img = album.getImage()
-  return dict(img=img)
-
 
 def main():
   import optparse
-  parser = optparse.OptionParser(__doc__.strip())
+  p = optparse.OptionParser()
 
   # we need a musicdns api key
-  parser.add_option('-k', '--musicdns-key', action='store_true',
-                    help="Music DNS key")
-  opts, args = parser.parse_args()
-  if not opts.musicdns_key:
-    keyfn = os.path.join(os.environ['HOME'], '.musicdns_key')
-    opts.musicdns_key = open(keyfn).read().strip()
+  p.add_option('-k', '--api-key', action='store_true')
+  
+  opt, arg = p.parse_args()
+  if not opt.api_key:
+    key = os.path.join(os.environ['HOME'], '.musicdns')
+    opt.api_key = open(key).read().strip()
 
-
+  # use CWD or passed argument
   try:
     dir_ = os.path.abspath(args[0])
   except:
@@ -309,20 +319,19 @@ def main():
   sep = os.path.sep
   files = [dir_ + sep + f for f in os.listdir(dir_) if f.endswith('mp3')]
   
-  response = scrub(files, opts.musicdns_key)
+  response = scrub(files, opt.api_key)
   metas = parse_metadata(response)
   
   for m in metas:
     if not m['artist'] or not m['title']:
       print 'FAILED to get metadata for ', m['file']
       continue
-
-    update_tags(m, dir_)
     
     try:
-      pass
+      update_tags(m, dir_)
     except Exception, e:
       print 'ERRORS while processing ' + m['file'], e
+      
   print len(metas), ' processed'
   
   
